@@ -95,6 +95,10 @@ Route::middleware(['auth'])->group(function () {
     Route::delete('/calendario/{id}', [CalendarioController::class, 'destroy']);
 
     // Financeiro Particular
-    Route::resource('financeiro_particular', FinanceiroParticularController::class);
+    Route::post('/financeiro_particular/analisar-ofx', [FinanceiroParticularController::class, 'analisarOfx'])->name('financeiro_particular.analisar_ofx');
+    Route::post('/financeiro_particular/salvar-lote', [FinanceiroParticularController::class, 'salvarLote'])->name('financeiro_particular.salvar_lote');
     Route::post('/financeiro_particular/{id}/pagar', [FinanceiroParticularController::class, 'pagar'])->name('financeiro_particular.pagar');
+    Route::post('/financeiro_particular/importar-ofx', [FinanceiroParticularController::class, 'importarOfx'])->name('financeiro_particular.importar_ofx');
+    Route::resource('financeiro_particular', FinanceiroParticularController::class);
+
 });

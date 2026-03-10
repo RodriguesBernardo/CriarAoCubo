@@ -8,6 +8,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Str;
 use Carbon\Carbon;
+use OfxParser\Parser;
 
 class FinanceiroParticularController extends Controller
 {
@@ -66,7 +67,7 @@ class FinanceiroParticularController extends Controller
             ->groupBy('categoria')
             ->map(fn($row) => $row->sum('valor'));
 
-    
+
         $dadosAnuais = FinanceiroParticular::selectRaw('MONTH(data_vencimento) as mes, tipo, SUM(valor) as total')
             ->where('user_id', Auth::id())
             ->whereYear('data_vencimento', $ano)
@@ -200,5 +201,208 @@ class FinanceiroParticularController extends Controller
         $fin->update($dados);
 
         return redirect()->back()->with('success', 'Atualizado com sucesso!');
+    }
+
+    public function importarOfx(Request $request)
+    {
+        $request->validate([
+            'arquivo_ofx' => 'required|file',
+            'responsavel_ofx' => 'required'
+        ]);
+
+        try {
+            $file = $request->file('arquivo_ofx');
+
+            $ofxParser = new Parser();
+            $ofx = $ofxParser->loadFromFile($file->getPathname());
+            $bankAccount = reset($ofx->bankAccounts);
+            $transactions = $bankAccount->statement->transactions;
+
+            $count = 0;
+            $grupoId = Str::uuid();
+
+            foreach ($transactions as $transaction) {
+                $tipo = $transaction->type === 'CREDIT' ? 'receita' : 'despesa';
+                $valor = abs($transaction->amount);
+                $data = $transaction->date->format('Y-m-d');
+                $descricao = $transaction->memo ?? 'Lançamento Importado';
+
+                $jaExiste = FinanceiroParticular::where('user_id', Auth::id())
+                    ->where('valor', $valor)
+                    ->where('data_vencimento', $data)
+                    ->where('tipo', $tipo)
+                    ->exists();
+
+                if (!$jaExiste) {
+                    FinanceiroParticular::create([
+                        'user_id' => Auth::id(),
+                        'grupo_id' => Str::uuid(),
+                        'descricao' => Str::limit($descricao, 255),
+                        'valor' => $valor,
+                        'data_vencimento' => $data,
+                        'tipo' => $tipo,
+                        'categoria' => 'Outros',
+                        'responsavel' => $request->responsavel_ofx,
+                        'pago' => true
+                    ]);
+                    $count++;
+                }
+            }
+
+            return redirect()->back()->with('success', "Importação concluída! {$count} novos lançamentos foram adicionados.");
+        } catch (\Exception $e) {
+            return redirect()->back()->withErrors(['erro' => 'Erro ao ler o arquivo OFX: ' . $e->getMessage()]);
+        }
+    }
+
+    public function analisarOfx(Request $request)
+    {
+        $request->validate(['arquivo_ofx' => 'required|file']);
+
+        try {
+            $content = file_get_contents($request->file('arquivo_ofx')->getPathname());
+
+            // 1. Extração via Regex
+            preg_match_all('/<STMTTRN>([\s\S]*?)(?=<\/?STMTTRN>|<\/BANKTRANLIST>)/', $content, $matches);
+
+            if (empty($matches[0])) {
+                return response()->json(['success' => false, 'message' => 'Nenhuma transação identificada no arquivo.']);
+            }
+
+            $lancamentos = [];
+            $descricoesParaIA = [];
+
+            foreach ($matches[0] as $index => $t) {
+                preg_match('/<DTPOSTED>(\d{4})(\d{2})(\d{2})/', $t, $dt);
+                $data = $dt ? "{$dt[1]}-{$dt[2]}-{$dt[3]}" : date('Y-m-d');
+
+                preg_match('/<TRNAMT>([-\d\.]+)/', $t, $amt);
+                $valorBruto = $amt ? (float) $amt[1] : 0;
+
+                preg_match('/<MEMO>(.*?)(?:<|\r|\n|$)/', $t, $memo);
+                $descricao = $memo ? trim($memo[1]) : 'Lançamento Importado';
+
+                $lancamentos[$index] = [
+                    'id_temp' => $index,
+                    'data_vencimento' => $data,
+                    'descricao' => \Illuminate\Support\Str::limit($descricao, 255),
+                    'valor' => abs($valorBruto),
+                    'tipo' => $valorBruto > 0 ? 'receita' : 'despesa',
+                    'categoria' => 'Outros' // Categoria padrão blindada
+                ];
+
+                $descricoesParaIA[] = [
+                    'id' => $index,
+                    'descricao' => $descricao,
+                    'valor' => $valorBruto
+                ];
+            }
+
+            // 2. Integração com IA (Com Debug e bypass de SSL para localhost)
+            $debugIA = 'Não executado';
+            try {
+                $apiKey = env('GEMINI_API_KEY');
+
+                if (!$apiKey) {
+                    $debugIA = "ERRO: Chave GEMINI_API_KEY não encontrada no arquivo .env.";
+                } else {
+                    $prompt = "Você é um assistente financeiro. Categorize as seguintes transações. 
+                    Retorne APENAS um array JSON válido, sem formatação markdown, com objetos contendo 'id' e 'categoria'.
+                    Categorias permitidas estritamente: Casa, Alimentação, Transporte, Lazer, Saúde, Esporte, Assinaturas, Estudos, Empreendimento, Roupas, Internet, Salário, Fatura, Outros.
+                    
+                    Regras de contexto:
+                    - Gastos com 'Natsport' ou academias são 'Esporte'.
+                    - Gastos em postos de combustível, Uber, ou manutenção da Yamaha FZ25 são 'Transporte'.
+                    - Compras de filamento, resina, Tinkercad, ou peças 3D são 'Empreendimento'.
+                    - Gastos com veterinário ou itens para cachorro são 'Casa'.
+                    - Estabelecimentos locais de Bento Gonçalves focados em comida são 'Alimentação'.
+                    
+                    Transações para categorizar: " . json_encode($descricoesParaIA);
+                    $response = \Illuminate\Support\Facades\Http::withoutVerifying()
+                        ->timeout(30)
+                        ->withHeaders(['Content-Type' => 'application/json'])
+                        ->post('https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=' . $apiKey, [
+                            'contents' => [['parts' => [['text' => $prompt]]]]
+                        ]);
+
+                    if ($response->successful()) {
+                        $iaText = $response->json('candidates.0.content.parts.0.text');
+                        $debugIA = "RESPOSTA BRUTA DA IA: " . $iaText;
+
+                        // Garante que vai extrair apenas o array JSON, ignorando textos em volta
+                        preg_match('/\[.*\]/s', $iaText, $jsonMatches);
+                        $cleanJson = $jsonMatches[0] ?? $iaText;
+
+                        $resultadoIA = json_decode(trim($cleanJson), true);
+
+                        if (is_array($resultadoIA)) {
+                            foreach ($resultadoIA as $item) {
+                                if (isset($item['id']) && isset($item['categoria']) && isset($lancamentos[(int)$item['id']])) {
+                                    $lancamentos[(int)$item['id']]['categoria'] = $item['categoria'];
+                                }
+                            }
+                            $debugIA .= " | SUCESSO: " . count($resultadoIA) . " itens processados.";
+                        } else {
+                            $debugIA .= " | ERRO: Falha ao fazer o json_decode. Formato inválido.";
+                        }
+                    } else {
+                        $debugIA = "ERRO DA API (HTTP " . $response->status() . "): " . $response->body();
+                    }
+                }
+            } catch (\Exception $e) {
+                $debugIA = "EXCEÇÃO NO PHP AO CHAMAR IA: " . $e->getMessage();
+            }
+
+            // Retornamos o debugIA junto para o frontend
+            return response()->json([
+                'success' => true,
+                'dados' => array_values($lancamentos),
+                'debug_ia' => $debugIA
+            ]);
+        } catch (\Exception $e) {
+            // Este catch pega erros críticos na leitura do arquivo
+            return response()->json(['success' => false, 'message' => 'Erro interno ao processar arquivo: ' . $e->getMessage(), 'line' => $e->getLine()], 500);
+        }
+    }
+
+    public function salvarLote(Request $request)
+    {
+        $dados = $request->validate([
+            'lancamentos' => 'required|array',
+            'lancamentos.*.descricao' => 'required|string',
+            'lancamentos.*.valor' => 'required|numeric',
+            'lancamentos.*.data_vencimento' => 'required|date',
+            'lancamentos.*.tipo' => 'required|string',
+            'lancamentos.*.categoria' => 'required|string',
+            'responsavel' => 'required|string'
+        ]);
+
+        $grupoId = Str::uuid();
+        $count = 0;
+
+        foreach ($dados['lancamentos'] as $lancamento) {
+            $existe = FinanceiroParticular::where('user_id', Auth::id())
+                ->where('valor', $lancamento['valor'])
+                ->where('data_vencimento', $lancamento['data_vencimento'])
+                ->where('tipo', $lancamento['tipo'])
+                ->exists();
+
+            if (!$existe) {
+                FinanceiroParticular::create([
+                    'user_id' => Auth::id(),
+                    'grupo_id' => $grupoId,
+                    'descricao' => $lancamento['descricao'],
+                    'valor' => $lancamento['valor'],
+                    'data_vencimento' => $lancamento['data_vencimento'],
+                    'tipo' => $lancamento['tipo'],
+                    'categoria' => $lancamento['categoria'],
+                    'responsavel' => $dados['responsavel'],
+                    'pago' => true
+                ]);
+                $count++;
+            }
+        }
+
+        return response()->json(['success' => true, 'message' => "{$count} lançamentos importados com sucesso!"]);
     }
 }
